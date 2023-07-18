@@ -1,0 +1,575 @@
+---
+title: "R5R_Analysis"
+author: "Matthew Martignoni"
+date: "2023-06-29"
+output: html_document
+---
+# Setting Up for R5R
+
+```{r setup, include=FALSE}
+
+library(r5r)
+library(sf)
+library(data.table)
+library(ggplot2)
+
+options(java.parameters = '-Xmx12G')
+
+library(spatstat)
+library(here)
+library(sp)
+library(rgeos)
+library(maptools)
+library(tmap)
+library(sf)
+library(geojson)
+library(geojsonio)
+library(tmaptools)
+library(tidyverse)
+library(dplyr)
+library(stringr)
+library(tmaptools)
+library(leafpop)
+library(leaflet)
+library(readr)
+library(janitor)
+library(dplyr)
+library(grid)
+library(OpenStreetMap)
+library(raster)
+library(fpc)
+library(dbscan)
+library(ggplot2)
+library(RSQLite)
+library(rgdal)
+library(terra)
+library(RColorBrewer)
+library(spdep)
+library(lubridate)
+library(zoo)
+library(viridis)
+library(ggplot2)
+library(dplyr)
+library(plotly)
+library(hrbrthemes)
+library(tools)
+library(UK2GTFS)
+```
+
+## Reading in and Formatting the POI Data and Shapefiles; Subsetting the UK-Wide Shapefiles to focus on London
+
+CSVs
+```{r}
+# List of CSV file paths
+csv_files <- c(
+  "/Users/martignoni/Documents/CASA/Dissertation/Notebooks/Data/POIs_detailed/Attractions/poi_5099126/Attractions.csv",
+  "/Users/martignoni/Documents/CASA/Dissertation/Notebooks/Data/POIs_detailed/Eating:Drinking/poi_5099125/Eating.csv",
+  "/Users/martignoni/Documents/CASA/Dissertation/Notebooks/Data/POIs_detailed/Education/poi_5099130/Education.csv",
+  "/Users/martignoni/Documents/CASA/Dissertation/Notebooks/Data/POIs_detailed/Entertainment/poi_5099129/Entertainment.csv",
+  "/Users/martignoni/Documents/CASA/Dissertation/Notebooks/Data/POIs_detailed/Government/poi_5099133/Government.csv",
+  "/Users/martignoni/Documents/CASA/Dissertation/Notebooks/Data/POIs_detailed/Grocery/poi_5099138/Grocery.csv",
+  "/Users/martignoni/Documents/CASA/Dissertation/Notebooks/Data/POIs_detailed/Health/poi_5099132/Health.csv",
+  "/Users/martignoni/Documents/CASA/Dissertation/Notebooks/Data/POIs_detailed/Infrastructure/poi_5099134/Infrastructure.csv",
+  "/Users/martignoni/Documents/CASA/Dissertation/Notebooks/Data/POIs_detailed/Organisations/poi_5099135/Organisations.csv",
+  "/Users/martignoni/Documents/CASA/Dissertation/Notebooks/Data/POIs_detailed/Retail/poi_5099137/Retail.csv")
+
+```
+
+Shapefiles and Subsetting
+```{r}
+# Define the file path to the London shapefile
+uk_shapefile <- "/Users/martignoni/Documents/CASA/Dissertation/LSOAs2021/LSOA_2021_EW_BGC.shp"
+
+# Read the 'lsoas2021' shapefile
+lsoas2021 <- st_read(uk_shapefile)
+
+# List of London boroughs
+london_boroughs <- c("Barking and Dagenham", "Barnet", "Bexley", "Brent", "Bromley", "Camden", "City of London", "Croydon", "Ealing", "Enfield", "Greenwich", "Hackney", "Hammersmith and Fulham", "Haringey", "Harrow", "Havering", "Hillingdon", "Hounslow", "Islington", "Kensington and Chelsea", "Kingston upon Thames", "Lambeth", "Lewisham", "Merton", "Newham", "Redbridge", "Richmond upon Thames", "Southwark", "Sutton", "Tower Hamlets", "Waltham Forest", "Wandsworth", "Westminster")
+
+# Subset the 'lsoas2021' shapefile by borough names - this is because otherwise we have the entire UK shapefile
+london_shapefile <- lsoas2021[grepl(paste(london_boroughs, collapse = "|"), lsoas2021$LSOA21NM), ]
+london_shapefile <- london_shapefile[!grepl("Brentwood", london_shapefile$LSOA21NM), ]
+
+# Read the London shapefile and transform to the right crs
+london_boundary <- london_shapefile %>%
+  st_transform(., 27700)
+
+category_names <- c("Attractions", "Eating", "Education", "Entertainment", "Government",
+                    "Grocery", "Health", "Infrustructure", "Organisations", "Retail")
+```
+
+Greenspace Shapefile - Turn it into Point Data / Centroids of Green Spaces
+- Part of the goal of this is to create a csv of green space centroid locations to treat as POIs. I could have used Greenspace access points - which could be multiple for many parks - and would lead to too many points or details when calculating the proximity to nearest. Using the centroids makes it more comparable to the other methods.
+```{r}
+
+# Read in Greenspace Shapefiles from the Ordinance Survey
+green <- st_read("/Users/martignoni/Documents/CASA/Dissertation/Notebooks/Data/POIs_detailed/Greenspace/open-greenspace_5109256/GB_GreenspaceSite.shp")
+
+green <- green %>% 
+  st_transform(., 27700)
+
+#Subset to London
+green_london <- st_intersection(green, london_boundary)
+
+# Clean up - remove rows with NA in the shapefile columns (where a POI didn't match with a LSOA)
+green_london <- green_london[!is.na(green_london), ]
+
+# Get the centroids of the greenspaces so I can use them as POIs
+centroids_green <- st_centroid(st_geometry(green_london))
+
+# Transform the centroids to WGS84 (EPSG:4326)
+centroids_green <- st_transform(centroids_green, crs = 4326)
+
+# Add the centroid coordinates to the centroids data frame
+centroids_green_data <- cbind(green_london, centroid_lat = st_coordinates(centroids_green)[, 2], centroid_lon = st_coordinates(centroids_green)[, 1])
+
+# Drop the polygon column because we will not need it when we export this as a csv to use below
+centroids_green_data <- centroids_green_data %>% 
+  st_drop_geometry("geometry")
+
+# Save your LSOA centroid data and your POI data to csv files
+write.csv(centroids_green_data, file = "/Users/martignoni/Documents/CASA/Dissertation/Notebooks/Data/POIs_detailed/Greenspace/Greenspace.csv")
+
+```
+
+Finally we read in all the POIs, including Greenspaces
+```{r}
+
+# Initialize an empty list to store the data frames
+data_list <- list()
+
+# Loop through each CSV file
+for (i in seq_along(csv_files)) {
+  csv_file <- csv_files[i]
+  category <- category_names[i]
+  
+  #Read in the CSVs, the CSVs are not seperated by a comma but rather a "|"
+  data <- read.csv(csv_file, sep = "|", stringsAsFactors = FALSE)
+  
+  #Add a new column called category so we can sort them more easily later
+  data$category <- category
+  
+  #Assign the df to the specified name
+  assign(category, data)
+  
+  #Add new df to the list
+  data_list[[category]] <- data
+}
+
+# Combine all dfs into one df of all POIs
+POIs <- do.call(rbind, data_list)
+
+# Read in the Greenspace CSV file
+# You cannot combine it with the others because it is different than the other files; we will just combine the points later when we make one massive London POI dataset.
+Greenspaces <- read.csv("/Users/martignoni/Documents/CASA/Dissertation/Notebooks/Data/POIs_detailed/Greenspace/Greenspace.csv")
+```
+
+## Coverting Easting/Northing to Latitude and Longitude, Subset POIs, Export to CSV so that I can use it for r5r
+
+This is converting to longitude and latitude because that's what r5r requires
+
+```{r}
+# GENERAL POIS
+crs <- CRS("+init=epsg:27700")
+
+# For other POIs, create a SpatialPoints object with the easting and northing coordinates
+spatial_points <- SpatialPoints(POIs[, c("feature_easting", "feature_northing")], proj4string = crs)
+
+# Change to Long/Lat
+spatial_points_ll <- spTransform(spatial_points, CRS("+proj=longlat +datum=WGS84"))
+
+# Extract the latitude and longitude from the transformed coordinates
+POIs$latitude <- coordinates(spatial_points_ll)[, 2]
+POIs$longitude <- coordinates(spatial_points_ll)[, 1]
+```
+
+I have to deal with greenspaces different because they're not from the same dataset/they're different...
+```{r}
+# GREENSPACES
+# Drop the specified columns
+Greenspaces <- Greenspaces %>% select(-c('distName1','distName2','distName3','distName4'))
+
+Greenspaces <- na.omit(Greenspaces, cols = c("centroid_lon", "centroid_lat"))
+
+# Create a SpatialPoints object with the latitude and longitude coordinates
+spatial_points_green <- SpatialPoints(Greenspaces[, c("centroid_lon", "centroid_lat")], proj4string = CRS("+proj=longlat +datum=WGS84"))
+
+# Transform to match your London boundary CRS
+Greenspaces_sf <- st_transform(Greenspaces_sf, crs = st_crs(london_boundary))
+
+# Now try the conversion again
+crs <- CRS("+init=epsg:27700")
+spatial_points_ll_green <- spTransform(spatial_points_green, CRS("+proj=longlat +datum=WGS84"))
+Greenspaces$latitude <- coordinates(spatial_points_ll_green)[, 2]
+Greenspaces$longitude <- coordinates(spatial_points_ll_green)[, 1]
+
+```
+
+## Read in the London Shapefile and Spatial Join
+This is just to be sure the points are entirely within the London boundaries
+
+```{r}
+# Convert the POIs dataframe to an sf object
+POIs_sf <- st_as_sf(POIs, coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(., 27700)
+
+# If you want to convert them into an sf object you can do
+Greenspaces_sf <- st_as_sf(Greenspaces, coords = c("centroid_lon", "centroid_lat"), crs = 4326)
+
+# Perform the spatial join
+joined_data <- st_join(POIs_sf, london_boundary, left = TRUE)
+
+# Clean up - remove rows with NA in the shapefile columns (where a POI didn't match with a LSOA)
+joined_data <- joined_data %>% drop_na()
+
+# Plot the map with points within the shapefile in green
+ggplot() +
+  geom_sf(data = joined_data, color = "green") +
+  geom_sf(data = london_boundary, fill = "transparent", color = "black") +
+  labs(x = "Longitude", y = "Latitude") +
+  ggtitle("POIs in London") +
+  theme_minimal()
+
+```
+
+
+```{r}
+# Get LSOA centroids
+centroids <- st_centroid(st_geometry(london_boundary))
+
+# Transform the centroids to WGS84 (EPSG:4326)
+centroids <- st_transform(centroids, crs = 4326)
+
+# Add the centroid coordinates to the centroids data frame
+centroid_data <- cbind(london_boundary, centroid_lat = st_coordinates(centroids)[, 2], centroid_lon = st_coordinates(centroids)[, 1])
+
+# Drop the polygon column because we will not need it
+centroid_data <- centroid_data %>% 
+  st_drop_geometry("geometry")
+
+# Save your LSOA centroid data and your POI data to csv files
+#write.csv(centroid_data, file = #"/Users/martignoni/Documents/CASA/Dissertation/R5R_Analysis/London_R5Rworkshop/LSOACentroids.csv")
+#write.csv(POIs, file = "/Users/martignoni/Documents/CASA/Dissertation/R5R_Analysis/London_R5Rworkshop/LondonP#OIs.csv")
+```
+
+# R5R Analysis
+
+```{r}
+r5r_core <- setup_r5(data_path = "/Users/martignoni/Documents/CASA/Dissertation/R5R_Analysis/London_R5Rworkshop")
+```
+
+# Old - Attempting to Get older GTFS Data
+Here, I was attempting to get older GTFS data for London but that didn't actually work because I got the same data as Duncan initially had (the dates were too recenty). One of the issues was that I am mostly getting schedules - which are set a while in advance - so the date I select needs to be at the end of May because that's the oldest I am going to get. As I understand it, that should be ok because schedules don't change too much. I can go back to emails with Duncan.
+
+```{r}
+#path_in <- "/Users/martignoni/Documents/CASA/Dissertation/R5R_Analysis/L.zip"
+#gtfs <- transxchange2gtfs(path_in = path_in, ncores = 3)
+
+#gtfs_write(gtfs, folder = "/Users/martignoni/Documents/CASA/Dissertation/R5R_Analysis/London_R5Rworkshop", name = "London_GTFS_April2023")
+
+#gtfs <- gtfs_merge(gtfs, force = TRUE)
+
+#gtfs <- gtfs_clean(gtfs)
+#gtfs <- gtfs_force_valid(gtfs)
+```
+
+
+NOTE: I NEED TO SUBSET THE POI FILES SO THEY'RE JUST CONTAINED WITHIN LONDON'S BOUNDARIES
+
+```{r}
+# Load the data
+LSOA_centroids <- fread(file.path("/Users/martignoni/Documents/CASA/Dissertation/R5R_Analysis/London_R5Rworkshop/LSOACentroids.csv"))
+LSOA_centroids$lat <- LSOA_centroids$centroid_lat	
+LSOA_centroids$lon <- LSOA_centroids$centroid_lon	
+LSOA_centroids$id <- LSOA_centroids$V1	
+
+destpoints <- fread(file.path("/Users/martignoni/Documents/CASA/Dissertation/R5R_Analysis/London_R5Rworkshop/LondonPOIs.csv"))
+destpoints$lat <- destpoints$latitude
+destpoints$lon <- destpoints$longitude	
+destpoints$id <- destpoints$ref_no	
+
+# PTAL Grids - THIS NEED TO UPDATED SO IT WORKS WITH R5R, NEEDS LAT/LON AND GEO INTO PTS NOT POLYGONS
+PTAL_grid <- st_read("/Users/martignoni/Documents/CASA/Dissertation/Notebooks/Data/PTAL Data/SHP_PTAL Grid 100m/PTAL_100m_Grid_Cells.shp")
+
+# Convert the shapefile to a data frame
+grid_100m <- as.data.frame(PTAL_grid)
+
+# Write the data frame to a CSV file
+write.csv(grid_100m, file = "/Users/martignoni/Documents/CASA/Dissertation/R5R_Analysis/London_R5Rworkshop/PTAL_Grid_Cells.csv", row.names = FALSE)
+
+# Create subsets of POIs
+subset_list <- split(destpoints, destpoints$category) %>%
+  lapply(function(subset) {
+    subset$category <- 1
+    subset$category <- as.integer(subset$category)
+    return(subset)
+  })
+
+poi_name <- c("Attractions", "Eating", "Education", "Entertainment", "Government", "Grocery", "Health", "Infrustructure", "Organisations", "Retail")
+
+subset_attractions <- subset_list$Attractions
+subset_eating <- subset_list$Eating
+subset_education <- subset_list$Education
+subset_entertainment <- subset_list$Entertainment
+subset_government <- subset_list$Government
+subset_grocery <- subset_list$Grocery
+subset_health <- subset_list$Health
+subset_infrustructure <- subset_list$Infrustructure
+subset_organisations <- subset_list$Organisations
+subset_retail <- subset_list$Retail
+
+# Change 'category' to binary (1) for all subsets
+subset_attractions$category <- 1
+subset_eating$category <- 1
+subset_education$category <- 1
+subset_entertainment$category <- 1
+subset_government$category <- 1
+subset_grocery$category <- 1
+subset_health$category <- 1
+subset_infrustructure$category <- 1
+subset_organisations$category <- 1
+subset_retail$category <- 1
+
+# Change 'category' to binary (1) for all subsets
+subset_attractions$category <- as.numeric(subset_attractions$category)
+subset_eating$category <- as.numeric(subset_eating$category)
+subset_education$category <- as.numeric(subset_education$category)
+subset_entertainment$category <- as.numeric(subset_entertainment$category)
+subset_government$category <- as.numeric(subset_government$category)
+subset_grocery$category <- as.numeric(subset_grocery$category)
+subset_health$category <- as.numeric(subset_health$category)
+subset_infrustructure$category <- as.numeric(subset_infrustructure$category)
+subset_organisations$category <- as.numeric(subset_organisations$category)
+subset_retail$category <- as.numeric(subset_retail$category)
+```
+
+## Setting up the R5R Package
+
+"For other public services, the priority can be less about choice and more about minimising access time to the nearest facility. This is the case for hospital accessibility. In the next example we will use the same accessibility function and tweak some settings. R5R does not natively calculate access times to the nearest facility, but we can approximate this analysis by testing multiple travel times in the cutoff variable-then we can repeat our accessibility function, this time switching the opportunity column from supermarkets to hospitals"
+
+**THE ABOVE DOES NOT SEEM TRUE, COST_TO_CLOSEST() DOES TRAVEL TIME TO NEAREST
+
+Q:
+What is percentiles?
+Maybe make it average of three nearest? This would show the presence of outliers on each LSOA centroid
+
+## General Access to Transit
+- Just use the walk time, that is what PTAL uses although it takes service frequency into account - how would I mirror that...?
+- max_walk_time - set this to 20 so that is kind of balances out that old people might push themselves to walk far and that young people might walk slowly - in other words, is 15 was old ppl and 25 was young ppl, this would be in the middle
+- travel_time_cutoff - not sure this is relevant?
+- departure time - the morning, earlier than just old people, like 8 am
+- time window ?
+- percentiles - just is taking the middle 50% distribution of what it finds
+
+Q: does it snap to the road network? How would I deal with congestion? Do I need to add an error term?
+
+
+```{r}
+#setting up the modes for general transit access
+mode <- c("WALK", "TRANSIT")
+max_walk_time <- 15 # in minutes
+travel_time_cutoff <- c(10,20,30,40,50,60,70,80) # in minutes
+departure_datetime <- as.POSIXct("25-05-2023 10:00:00", format = "%d-%m-%Y %H:%M:%S") # - Older people might travel later in the day for appointments and such
+time_window <- 30 # in minutes
+percentiles <- 50
+```
+
+
+```{r}
+access_dfs <- lapply(subset_list, function(subset) {
+  access_subset <- accessibility(r5r_core,
+                                origins = LSOA_centroids,
+                                destinations = subset,
+                                mode = mode,
+                                opportunities_colnames = c("category"),
+                                decay_value = 2, 
+                                decay_function = "logistic",
+                                cutoffs = travel_time_cutoff,
+                                departure_datetime = departure_datetime,
+                                max_walk_time = max_walk_time,
+                                time_window = time_window,
+                                percentiles = percentiles,
+                                progress = TRUE)
+  return(access_subset)
+})
+
+for (i in seq_along(access_dfs)) {
+  access_dfs[[i]]$category <- names(access_dfs)[i]
+```
+
+## Running the Query: Health (for older people)
+I am running this query while setting the parameters to fit with older people's mobility aka shorter walk times (captured below). I use the decay value of 2 because its big enough to reflect that older people might not be inclined to make regular trips but its also not too intense because they will have to make trips to see GPs. Also, sometimes, older people will have younger individuals accompany them to appointments. I also think its useful to not just limit to GPs, Hospitals, care facilities, etc because the medical needs of older people are wide ranging depending on their conditions. Some might rarely go to GPs because they need to see certain specialists. Some might be in better health and just go to their GPs on occasion.
+
+```{r}
+#setting up the modes for OLDER PEOPLE
+mode <- c("WALK", "TRANSIT")
+max_walk_time <- 15 # in minutes
+travel_time_cutoff <- c(10,20,30,40,50,60,70,80) # in minutes
+departure_datetime <- as.POSIXct("25-05-2023 10:00:00", format = "%d-%m-%Y %H:%M:%S") # - Older people might travel later in the day for appointments and such
+time_window <- 30 # in minutes
+percentiles <- 50
+```
+
+
+```{r}
+access_dfs <- lapply(subset_list, function(subset) {
+  access_subset <- accessibility(r5r_core,
+                                origins = LSOA_centroids,
+                                destinations = subset,
+                                mode = mode,
+                                opportunities_colnames = c("category"),
+                                decay_value = 2, 
+                                decay_function = "logistic",
+                                cutoffs = travel_time_cutoff,
+                                departure_datetime = departure_datetime,
+                                max_walk_time = max_walk_time,
+                                time_window = time_window,
+                                percentiles = percentiles,
+                                progress = TRUE)
+  return(access_subset)
+})
+
+for (i in seq_along(access_dfs)) {
+  access_dfs[[i]]$category <- names(access_dfs)[i]
+}
+```
+
+
+I NEED TO CHANGE THIS TO BE THE TRAVEL TIME TO THE CLOSEST ONE WHICH REQUIRES ME TO FIND A TRAVEL TIME MATRIX - BUT THEN SHOULD I SUBSET THINGS EVEN FURTHER SO ITS JUST PRIMARY SCHOOLS/UNIS/HOSPTIALS/ETC. AKA IT IS MORE SPECIFIC - AND THE USE cost_to_closest() - https://ipeagit.github.io/intro_access_book/3_calculando_acesso.en.html
+
+**I NEED TO FIND A WAY TO BE ABLE TO JOIN THIS BACK TO THE CENTROIDS**
+
+Old code:
+access_subset_eating <- accessibility(r5r_core, # HOW WOULD I SET THIS TO THE NEAREST 3
+                        origins = LSOA_centroids,
+                        destinations = subset_eating,
+                        mode = mode,
+                        opportunities_colnames = c("category"),
+                        decay_value = 2, # I DON'T REALLY UNDERSTAND WHAT THIS MEANS
+                        decay_function = "logistic",
+                        cutoffs = travel_time_cutoff,
+                        departure_datetime = departure_datetime,
+                        max_walk_time = max_walk_time,
+                        time_window = time_window,
+                        percentiles = percentiles,
+                        progress = TRUE)
+
+access_subset_education <- accessibility(r5r_core, # HOW WOULD I SET THIS TO THE NEAREST 3
+                        origins = LSOA_centroids,
+                        destinations = subset_education,
+                        mode = mode,
+                        opportunities_colnames = c("category"),
+                        decay_value = 2, # I DON'T REALLY UNDERSTAND WHAT THIS MEANS
+                        decay_function = "logistic",
+                        cutoffs = travel_time_cutoff,
+                        departure_datetime = departure_datetime,
+                        max_walk_time = max_walk_time,
+                        time_window = time_window,
+                        percentiles = percentiles,
+                        progress = TRUE)
+
+access_subset_entertainment <- accessibility(r5r_core, # HOW WOULD I SET THIS TO THE NEAREST 3
+                        origins = LSOA_centroids,
+                        destinations = subset_entertainment,
+                        mode = mode,
+                        opportunities_colnames = c("category"),
+                        decay_value = 2, # I DON'T REALLY UNDERSTAND WHAT THIS MEANS
+                        decay_function = "logistic",
+                        cutoffs = travel_time_cutoff,
+                        departure_datetime = departure_datetime,
+                        max_walk_time = max_walk_time,
+                        time_window = time_window,
+                        percentiles = percentiles,
+                        progress = TRUE)
+
+access_subset_government <- accessibility(r5r_core, # HOW WOULD I SET THIS TO THE NEAREST 3
+                        origins = LSOA_centroids,
+                        destinations = subset_government,
+                        mode = mode,
+                        opportunities_colnames = c("category"),
+                        decay_value = 2, # I DON'T REALLY UNDERSTAND WHAT THIS MEANS
+                        decay_function = "logistic",
+                        cutoffs = travel_time_cutoff,
+                        departure_datetime = departure_datetime,
+                        max_walk_time = max_walk_time,
+                        time_window = time_window,
+                        percentiles = percentiles,
+                        progress = TRUE)
+
+access_subset_grocery <- accessibility(r5r_core, # HOW WOULD I SET THIS TO THE NEAREST 3
+                        origins = LSOA_centroids,
+                        destinations = subset_grocery,
+                        mode = mode,
+                        opportunities_colnames = c("category"),
+                        decay_value = 2, # I DON'T REALLY UNDERSTAND WHAT THIS MEANS
+                        decay_function = "logistic",
+                        cutoffs = travel_time_cutoff,
+                        departure_datetime = departure_datetime,
+                        max_walk_time = max_walk_time,
+                        time_window = time_window,
+                        percentiles = percentiles,
+                        progress = TRUE)
+
+access_subset_health <- accessibility(r5r_core, # HOW WOULD I SET THIS TO THE NEAREST 3
+                        origins = LSOA_centroids,
+                        destinations = subset_health,
+                        mode = mode,
+                        opportunities_colnames = c("category"),
+                        decay_value = 2, # I DON'T REALLY UNDERSTAND WHAT THIS MEANS
+                        decay_function = "logistic",
+                        cutoffs = travel_time_cutoff,
+                        departure_datetime = departure_datetime,
+                        max_walk_time = max_walk_time,
+                        time_window = time_window,
+                        percentiles = percentiles,
+                        progress = TRUE)
+
+access_subset_infrustructure <- accessibility(r5r_core, # HOW WOULD I SET THIS TO THE NEAREST 3
+                        origins = LSOA_centroids,
+                        destinations = subset_infrustructure,
+                        mode = mode,
+                        opportunities_colnames = c("category"),
+                        decay_value = 2, # I DON'T REALLY UNDERSTAND WHAT THIS MEANS
+                        decay_function = "logistic",
+                        cutoffs = travel_time_cutoff,
+                        departure_datetime = departure_datetime,
+                        max_walk_time = max_walk_time,
+                        time_window = time_window,
+                        percentiles = percentiles,
+                        progress = TRUE)
+
+access_subset_organisations <- accessibility(r5r_core, # HOW WOULD I SET THIS TO THE NEAREST 3
+                        origins = LSOA_centroids,
+                        destinations = subset_organisations,
+                        mode = mode,
+                        opportunities_colnames = c("category"),
+                        decay_value = 2, # I DON'T REALLY UNDERSTAND WHAT THIS MEANS
+                        decay_function = "logistic",
+                        cutoffs = travel_time_cutoff,
+                        departure_datetime = departure_datetime,
+                        max_walk_time = max_walk_time,
+                        time_window = time_window,
+                        percentiles = percentiles,
+                        progress = TRUE)
+
+access_subset_retail <- accessibility(r5r_core, # HOW WOULD I SET THIS TO THE NEAREST 3
+                        origins = LSOA_centroids,
+                        destinations = subset_retail,
+                        mode = mode,
+                        opportunities_colnames = c("category"),
+                        decay_value = 2, # I DON'T REALLY UNDERSTAND WHAT THIS MEANS
+                        decay_function = "logistic",
+                        cutoffs = travel_time_cutoff,
+                        departure_datetime = departure_datetime,
+                        max_walk_time = max_walk_time,
+                        time_window = time_window,
+                        percentiles = percentiles,
+                        progress = TRUE)
+
+
+
+
+
+
+
+
